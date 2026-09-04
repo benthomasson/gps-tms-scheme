@@ -276,7 +276,7 @@
              '("son-at-home" "car-needs-battery" "have-money" "have-phone-book")
              plan school-ops)]
            [assumptions (network-trace-assumptions net "son-at-school")])
-      (assert-member "son-at-home" assumptions "traces to son-at-home")
+      (assert-member "pre:son-at-home" assumptions "traces to son-at-home snapshot")
       (assert-member "have-phone-book" assumptions "traces to have-phone-book"))))
 
 (test "tms_retract_initial_cascades"
@@ -305,9 +305,9 @@
     (let ([net (gps->network
             '("son-at-home" "car-needs-battery" "have-money" "have-phone-book")
             plan school-ops)])
-      (network-retract! net "have-money")
+      (network-retract! net "pre:have-money")
       (assert-equal (node-tv net "son-at-school") "OUT" "goal out")
-      (network-assert-node! net "have-money")
+      (network-assert-node! net "pre:have-money")
       (assert-equal (node-tv net "son-at-school") "IN" "goal restored"))))
 
 (test "tms_logistics_explain"
@@ -330,8 +330,81 @@
             plan banana-ops)])
       (assert-equal (node-tv net "not-hungry") "IN" "goal in")
       ;; What if the chair wasn't at the door?
-      (network-retract! net "chair-at-door")
+      (network-retract! net "pre:chair-at-door")
       (assert-equal (node-tv net "not-hungry") "OUT" "no chair, no bananas"))))
+
+;; ---- TestDeletionModeling ----
+
+(display "\n=== TestDeletionModeling ===\n")
+
+(test "school_deletions_reflected"
+  (let-values ([(plan final) (gps
+      '("son-at-home" "car-needs-battery" "have-money" "have-phone-book")
+      '("son-at-school")
+      school-ops)])
+    (let ([net (gps->network
+            '("son-at-home" "car-needs-battery" "have-money" "have-phone-book")
+            plan school-ops)])
+      (assert-equal (node-tv net "son-at-home") "OUT"
+                    "son-at-home deleted by drive")
+      (assert-equal (node-tv net "have-money") "OUT"
+                    "have-money deleted by give-shop-money")
+      (assert-equal (node-tv net "have-phone-book") "IN"
+                    "have-phone-book not deleted")
+      (assert-equal (node-tv net "car-needs-battery") "IN"
+                    "car-needs-battery not deleted"))))
+
+(test "banana_deletions_reflected"
+  (let-values ([(plan final) (gps
+      '("at-door" "on-floor" "has-ball" "hungry" "chair-at-door")
+      '("not-hungry")
+      banana-ops)])
+    (let ([net (gps->network
+            '("at-door" "on-floor" "has-ball" "hungry" "chair-at-door")
+            plan banana-ops)])
+      (assert-equal (node-tv net "chair-at-door") "OUT" "chair moved")
+      (assert-equal (node-tv net "at-door") "OUT" "left door")
+      (assert-equal (node-tv net "on-floor") "OUT" "climbed up")
+      (assert-equal (node-tv net "hungry") "OUT" "ate bananas")
+      (assert-equal (node-tv net "has-ball") "IN" "ball untouched"))))
+
+(test "logistics_deletions_reflected"
+  (let-values ([(plan final) (gps
+      '("package-at-A" "truck-at-A")
+      '("package-at-B")
+      logistics-ops)])
+    (let ([net (gps->network '("package-at-A" "truck-at-A") plan logistics-ops)])
+      (assert-equal (node-tv net "package-at-A") "OUT" "package picked up")
+      (assert-equal (node-tv net "truck-at-A") "OUT" "truck moved"))))
+
+(test "deletion_reverses_when_action_undone"
+  (let-values ([(plan final) (gps
+      '("son-at-home" "car-needs-battery" "have-money" "have-phone-book")
+      '("son-at-school")
+      school-ops)])
+    (let ([net (gps->network
+            '("son-at-home" "car-needs-battery" "have-money" "have-phone-book")
+            plan school-ops)])
+      (assert-equal (node-tv net "have-money") "OUT" "money spent")
+      ;; Undo the give-money action by retracting its snapshot
+      (network-retract! net "pre:have-money")
+      (assert-equal (node-tv net "do:give-shop-money") "OUT" "action undone")
+      (assert-equal (node-tv net "have-money") "IN"
+                    "money comes back (action undone, deletion reversed)"))))
+
+(test "snapshot_cascade_through_effects"
+  (let-values ([(plan final) (gps
+      '("package-at-A" "truck-at-A")
+      '("package-at-B")
+      logistics-ops)])
+    (let ([net (gps->network '("package-at-A" "truck-at-A") plan logistics-ops)])
+      ;; Retract truck-at-A snapshot — entire chain collapses
+      (network-retract! net "pre:truck-at-A")
+      (assert-equal (node-tv net "do:drive-A-to-B") "OUT" "drive undone")
+      (assert-equal (node-tv net "truck-at-B") "OUT" "truck not at B")
+      (assert-equal (node-tv net "package-at-B") "OUT" "package not delivered")
+      ;; truck-at-A comes back (deletion reversed)
+      (assert-equal (node-tv net "truck-at-A") "IN" "truck still at A"))))
 
 ;; ---- Summary ----
 

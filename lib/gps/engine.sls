@@ -48,39 +48,129 @@
                                    (difference (car r) (op-del-list op)))])
              (cons new-state (append (cdr r) (list (op-action op))))))))
 
-  ;;; Phase 2: TMS execution. Build a belief network that explains
-  ;;; WHY each goal is achieved — the justification chain from goals
-  ;;; back through operators to initial conditions.
+  ;;; Phase 2: TMS execution. Build a belief network that models
+  ;;; the full plan including state transitions.
   ;;;
-  ;;; The TMS adds: network-explain traces, retraction what-if analysis,
-  ;;; network-trace-assumptions to find critical initial conditions.
+  ;;; Delete-lists use the TMS outlist mechanism: when an action goes IN,
+  ;;; conditions it deletes go OUT. For circular cases (action depends on
+  ;;; what it deletes), snapshot premises break the cycle.
+  ;;;
+  ;;; After execution, the network reflects the final state: deleted
+  ;;; conditions are OUT, added conditions are IN. Retract a snapshot
+  ;;; premise to see what breaks; the deleted condition comes back IN
+  ;;; (the deletion is undone because the action is undone).
 
   (define (gps->network initial-state plan ops)
     (let ([net (make-network)]
-          [idx (make-hashtable string-hash string=?)])
+          [idx (make-hashtable string-hash string=?)]
+          [deleted-by (make-hashtable string-hash string=?)]
+          [snap-map (make-hashtable string-hash string=?)]
+          [created-by (make-hashtable string-hash string=?)])
       (for-each (lambda (o) (hashtable-set! idx (op-action o) o)) ops)
-      ;; Initial conditions as premise nodes
-      (for-each (lambda (c) (network-add-node! net c c)) initial-state)
-      ;; Each plan step: action node justified by preconditions,
-      ;; effect nodes justified by the action
+
+      ;; Track which action creates each condition (initial = #f)
+      (for-each (lambda (c) (hashtable-set! created-by c #f)) initial-state)
+      (for-each
+        (lambda (action)
+          (let ([op (hashtable-ref idx action #f)])
+            (when op
+              (for-each
+                (lambda (c)
+                  (unless (hashtable-contains? created-by c)
+                    (hashtable-set! created-by c
+                      (string-append "do:" action))))
+                (op-add-list op)))))
+        plan)
+
+      ;; deleted-by: condition -> list of "do:action" that delete it
       (for-each
         (lambda (action)
           (let ([op (hashtable-ref idx action #f)])
             (when op
               (let ([aid (string-append "do:" action)])
-                (network-add-node! net aid action
+                (for-each
+                  (lambda (c)
+                    (hashtable-update! deleted-by c
+                      (lambda (xs) (cons aid xs)) '()))
+                  (op-del-list op))))))
+        plan)
+
+      ;; snap-map: action -> ((cond . snap-id) ...) for volatile preconds.
+      ;; Any precondition deleted by ANY action in the plan gets a snapshot
+      ;; so the action's justification survives the deletion.
+      (for-each
+        (lambda (action)
+          (let ([op (hashtable-ref idx action #f)])
+            (when op
+              (let ([volatile (keep
+                      (lambda (c) (pair? (hashtable-ref deleted-by c '())))
+                      (op-preconds op))])
+                (unless (null? volatile)
+                  (hashtable-set! snap-map action
+                    (map (lambda (c)
+                           (cons c (string-append "pre:" c)))
+                         volatile)))))))
+        plan)
+
+      ;; 1. All initial conditions (with outlist for deleted ones)
+      (for-each
+        (lambda (c)
+          (let ([deleters (hashtable-ref deleted-by c '())])
+            (if (null? deleters)
+                (network-add-node! net c c)
+                (network-add-node! net c c
                   (list (cons 'justifications
-                    (list (make-justification "SL" (op-preconds op) '()
-                            action "")))))
+                    (list (make-justification "SL" '() deleters "" ""))))))))
+        initial-state)
+
+      ;; 2. Execute plan steps in order
+      (for-each
+        (lambda (action)
+          (let ([op (hashtable-ref idx action #f)])
+            (when op
+              (let* ([aid (string-append "do:" action)]
+                     [snaps (hashtable-ref snap-map action '())])
+                ;; 2a. Create snapshots for volatile preconditions
+                (for-each
+                  (lambda (pair)
+                    (let ([snap-id (cdr pair)]
+                          [cond-name (car pair)])
+                      (unless (hashtable-ref (network-nodes net) snap-id #f)
+                        (let ([creator (hashtable-ref created-by cond-name #f)])
+                          (if creator
+                              (network-add-node! net snap-id cond-name
+                                (list (cons 'justifications
+                                  (list (make-justification "SL"
+                                          (list creator) '() "" "")))))
+                              (network-add-node! net snap-id cond-name))))))
+                  snaps)
+                ;; 2b. Action node (snapshot substitution in preconds)
+                (let ([preconds (map (lambda (c)
+                                       (let ([s (assoc c snaps)])
+                                         (if s (cdr s) c)))
+                                     (op-preconds op))])
+                  (network-add-node! net aid action
+                    (list (cons 'justifications
+                      (list (make-justification "SL" preconds '()
+                              action ""))))))
+                ;; 2c. Effect nodes (with outlist for later deletions)
                 (for-each
                   (lambda (c)
                     (unless (hashtable-ref (network-nodes net) c #f)
-                      (network-add-node! net c c
-                        (list (cons 'justifications
-                          (list (make-justification "SL" (list aid) '()
-                                  "" "")))))))
+                      (let ([del (hashtable-ref deleted-by c '())])
+                        (network-add-node! net c c
+                          (list (cons 'justifications
+                            (list (make-justification "SL" (list aid) del
+                                    "" ""))))))))
                   (op-add-list op))))))
         plan)
+
+      ;; 3. Fix dependent registrations and truth values.
+      ;; Outlist entries created before their target actions need
+      ;; re-registration; truth values need recomputing for deletions.
+      (network-rebuild-dependents! net)
+      (network-recompute-all! net)
+
       net))
 
   ;;; Set helpers
